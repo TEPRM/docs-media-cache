@@ -338,26 +338,22 @@ jobs:
                       download_success = False
                       last_error = None
 
-                      # PHASE 1: Try Invidious instances (best chance without cookies)
+                      # PHASE 1: Try Invidious instances by converting URL
                       log("[youtube] Phase 1: Trying Invidious instances...")
                       for instance in INVIDIOUS_INSTANCES:
                           if download_success:
                               break
                           try:
-                              log(f"[youtube] trying Invidious instance: {instance}")
+                              invidious_url = f"{instance}/watch?v={video_id}"
+                              log(f"[youtube] trying Invidious: {invidious_url}")
                               ydl_opts = base_ydl_opts.copy()
-                              # Use Invidious instance as the extractor
-                              ydl_opts["extractor_args"] = {
-                                  "youtube": {
-                                      "invidioud_instances": [instance],
-                                  }
-                              }
+                              # Use generic extractor for Invidious URLs
                               with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                  info = ydl.extract_info(URL, download=False)
+                                  info = ydl.extract_info(invidious_url, download=False)
                                   title = info.get("title", "video")
                                   duration = info.get("duration", 0)
                                   log(f"[youtube] title: {title}, duration: {duration}s")
-                                  ydl.download([URL])
+                                  ydl.download([invidious_url])
                               log(f"[youtube] download completed via {instance}")
                               download_success = True
                               break
@@ -400,6 +396,34 @@ jobs:
                                   last_error = exc
                                   log(f"[youtube] {client_name} client failed: {exc}")
                                   continue
+
+                      # PHASE 3: Try with Chrome cookies as last resort
+                      if not download_success:
+                          try:
+                              log("[youtube] Phase 3: trying with Chrome cookies...")
+                              ydl_opts = base_ydl_opts.copy()
+                              ydl_opts["cookies_from_browser"] = ("chrome",)
+                              ydl_opts["extractor_args"] = {
+                                  "youtube": {
+                                      "player_client": ["android", "web"],
+                                      "player_skip": ["configs", "webpage"],
+                                  }
+                              }
+                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                  info = ydl.extract_info(URL, download=False)
+                                  title = info.get("title", "video")
+                                  duration = info.get("duration", 0)
+                                  log(f"[youtube] title: {title}, duration: {duration}s")
+                                  ydl.download([URL])
+                              log("[youtube] download completed with Chrome cookies")
+                              download_success = True
+                          except Exception as exc:
+                              last_error = exc
+                              log(f"[youtube] Chrome cookies also failed: {exc}")
+
+                      if not download_success:
+                          bail("yt-dlp failed with all methods: {}".format(last_error),
+                               last_error=str(last_error))
 
                       # PHASE 3: Try with Chrome cookies as last resort
                       if not download_success:
