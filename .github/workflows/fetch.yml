@@ -296,8 +296,18 @@ jobs:
                           video_id = qs.get("v", [None])[0]
                       log(f"[youtube] video_id: {video_id}")
 
-                      # yt-dlp options: try multiple player clients to bypass bot detection
-                      # Strategy: try android/tv clients first (often work without cookies), then web
+                      # First, try Invidious/Piped instances (public YouTube proxies that don't need cookies)
+                      # These are known working public instances
+                      INVIDIOUS_INSTANCES = [
+                          "https://yewtu.be",
+                          "https://inv.nadeko.net", 
+                          "https://inv.riverside.rocks",
+                          "https://invidious.snopyta.org",
+                          "https://inv.tux.pizza",
+                          "https://yewtu.be",
+                      ]
+
+                      # yt-dlp options
                       base_ydl_opts = {
                           "format": "bestvideo+bestaudio/best",
                           "merge_output_format": "mp4",
@@ -325,7 +335,99 @@ jobs:
                           base_ydl_opts["cookiefile"] = cookie_file.name
                           log("[youtube] using cookies from YOUTUBE_COOKIES secret")
 
-                      # Try different player clients in order of likelihood to work without cookies
+                      download_success = False
+                      last_error = None
+
+                      # PHASE 1: Try Invidious instances (best chance without cookies)
+                      log("[youtube] Phase 1: Trying Invidious instances...")
+                      for instance in INVIDIOUS_INSTANCES:
+                          if download_success:
+                              break
+                          try:
+                              log(f"[youtube] trying Invidious instance: {instance}")
+                              ydl_opts = base_ydl_opts.copy()
+                              # Use Invidious instance as the extractor
+                              ydl_opts["extractor_args"] = {
+                                  "youtube": {
+                                      "invidioud_instances": [instance],
+                                  }
+                              }
+                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                  info = ydl.extract_info(URL, download=False)
+                                  title = info.get("title", "video")
+                                  duration = info.get("duration", 0)
+                                  log(f"[youtube] title: {title}, duration: {duration}s")
+                                  ydl.download([URL])
+                              log(f"[youtube] download completed via {instance}")
+                              download_success = True
+                              break
+                          except Exception as exc:
+                              last_error = exc
+                              log(f"[youtube] Invidious {instance} failed: {exc}")
+                              continue
+
+                      # PHASE 2: Try different player clients (android/tv often work without cookies)
+                      if not download_success:
+                          log("[youtube] Phase 2: Trying player clients...")
+                          player_clients = [
+                              ("android", "Android client"),
+                              ("tv", "TV client"),
+                              ("web", "Web client"),
+                          ]
+
+                          for client_name, client_desc in player_clients:
+                              if download_success:
+                                  break
+                              try:
+                                  log(f"[youtube] trying with {client_desc}...")
+                                  ydl_opts = base_ydl_opts.copy()
+                                  ydl_opts["extractor_args"] = {
+                                      "youtube": {
+                                          "player_client": [client_name],
+                                          "player_skip": ["configs", "webpage"],
+                                      }
+                                  }
+                                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                      info = ydl.extract_info(URL, download=False)
+                                      title = info.get("title", "video")
+                                      duration = info.get("duration", 0)
+                                      log(f"[youtube] title: {title}, duration: {duration}s")
+                                      ydl.download([URL])
+                                  log(f"[youtube] download completed with {client_name} client")
+                                  download_success = True
+                                  break
+                              except Exception as exc:
+                                  last_error = exc
+                                  log(f"[youtube] {client_name} client failed: {exc}")
+                                  continue
+
+                      # PHASE 3: Try with Chrome cookies as last resort
+                      if not download_success:
+                          try:
+                              log("[youtube] Phase 3: trying with Chrome cookies...")
+                              ydl_opts = base_ydl_opts.copy()
+                              ydl_opts["cookies_from_browser"] = ("chrome",)
+                              ydl_opts["extractor_args"] = {
+                                  "youtube": {
+                                      "player_client": ["android", "web"],
+                                      "player_skip": ["configs", "webpage"],
+                                  }
+                              }
+                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                  info = ydl.extract_info(URL, download=False)
+                                  title = info.get("title", "video")
+                                  duration = info.get("duration", 0)
+                                  log(f"[youtube] title: {title}, duration: {duration}s")
+                                  ydl.download([URL])
+                              log("[youtube] download completed with Chrome cookies")
+                              download_success = True
+                          except Exception as exc:
+                              last_error = exc
+                              log(f"[youtube] Chrome cookies also failed: {exc}")
+
+                      if not download_success:
+                          bail("yt-dlp failed with all methods: {}".format(last_error),
+                               last_error=str(last_error))
                       player_clients = [
                           ("android", "Android client (often works without cookies)"),
                           ("tv", "TV client (often works without cookies)"),
