@@ -89,6 +89,7 @@ jobs:
       PART_NAME: ${{ inputs.part_name }}
       PUBLISH_RELEASE: ${{ inputs.publish_release }}
       RELEASE_NAME: ${{ inputs.release_name }}
+      YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
     steps:
       - name: Set up Python
@@ -143,6 +144,7 @@ jobs:
           MAX_PAGE_BYTES = int(os.environ.get("MAX_PAGE_BYTES", "52428800"))
           GDRIVE_CLIENT_ID = os.environ.get("GDRIVE_CLIENT_ID", "")
           GDRIVE_CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET", "")
+          YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "").strip()
           BYTE_START = os.environ.get("BYTE_START", "").strip()
           BYTE_END = os.environ.get("BYTE_END", "").strip()
           PART_INDEX = os.environ.get("PART_INDEX", "").strip()
@@ -313,6 +315,15 @@ jobs:
                               {"key": "EmbedThumbnail"},
                           ],
                       }
+
+                      # Add cookies if provided via YOUTUBE_COOKIES secret
+                      if YOUTUBE_COOKIES:
+                          import tempfile
+                          cookie_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+                          cookie_file.write(YOUTUBE_COOKIES)
+                          cookie_file.close()
+                          base_ydl_opts["cookiefile"] = cookie_file.name
+                          log("[youtube] using cookies from YOUTUBE_COOKIES secret")
 
                       # Try different player clients in order of likelihood to work without cookies
                       player_clients = [
