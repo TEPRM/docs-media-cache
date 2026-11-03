@@ -376,7 +376,7 @@ jobs:
 
                       if not download_success:
                           bail("yt-dlp failed with all methods: {}".format(last_error),
-                               error=str(last_error))
+                               last_error=str(last_error))
 
                       # Find downloaded file
                       files = sorted(p for p in OUT.iterdir() if p.is_file() and p.name != "_manifest.json")
