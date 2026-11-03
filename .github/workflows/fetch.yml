@@ -347,7 +347,8 @@ jobs:
                               invidious_url = f"{instance}/watch?v={video_id}"
                               log(f"[youtube] trying Invidious: {invidious_url}")
                               ydl_opts = base_ydl_opts.copy()
-                              # Use generic extractor for Invidious URLs
+                              # Force generic extractor to avoid YouTube extractor detection
+                              ydl_opts["force_generic_extractor"] = True
                               with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                                   info = ydl.extract_info(invidious_url, download=False)
                                   title = info.get("title", "video")
