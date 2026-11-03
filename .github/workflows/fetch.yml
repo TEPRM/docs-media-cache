@@ -102,6 +102,9 @@ jobs:
           chrome-version: stable
 
       - name: Restore pip cache
+        # Cache holds only public PyPI wheels (~/.cache/pip). No URLs,
+        # results or logs ever touch this directory. The key is deliberately
+        # meaningless so the cache list reveals nothing about this repo.
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -288,132 +291,142 @@ jobs:
           # Uses Chrome cookies for authentication (bypasses bot detection).
           # ---------------------------------------------------------------
           if MODE == "youtube":
-              import yt_dlp
-              import traceback
-
-              log("[youtube] starting download with yt-dlp")
-
-              # Extract video ID for manifest
-              video_id = None
-              import urllib.parse
-              parsed = urllib.parse.urlparse(URL)
-              if parsed.hostname in ("youtu.be",):
-                  video_id = parsed.path.lstrip("/")
-              elif parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
-                  qs = urllib.parse.parse_qs(parsed.query)
-                  video_id = qs.get("v", [None])[0]
-
-              # yt-dlp options: best quality, merge formats, embed metadata, USE CHROME COOKIES
-              ydl_opts = {
-                  "format": "bestvideo+bestaudio/best",
-                  "merge_output_format": "mp4",
-                  "outtmpl": str(OUT / "%(title)s.%(ext)s"),
-                  "quiet": False,
-                  "no_warnings": False,
-                  "ignoreerrors": False,
-                  "retries": 3,
-                  "fragment_retries": 3,
-                  "extractor_retries": 3,
-                  "user_agent": UA,
-                  "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
-                  "cookies_from_browser": ("chrome",),  # Use Chrome cookies!
-                  "postprocessors": [
-                      {"key": "FFmpegMetadata"},
-                      {"key": "EmbedThumbnail"},
-                  ],
-              }
-
-              # Try direct download with Chrome cookies
+              log("[youtube] starting YouTube mode")
               try:
-                  log("[youtube] trying direct download with Chrome cookies...")
-                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                      # First extract info to get title
-                      info = ydl.extract_info(URL, download=False)
-                      title = info.get("title", "video")
-                      duration = info.get("duration", 0)
-                      log(f"[youtube] title: {title}, duration: {duration}s")
+                  import yt_dlp
+                  import traceback
+                  import urllib.parse
+                  from pathlib import Path
+                  import zipfile
 
-                      # Now download
-                      ydl.download([URL])
-                  log("[youtube] direct download completed")
-              except Exception as exc:
-                  log(f"[youtube] direct download failed: {exc}")
-                  log(f"[youtube] traceback: {traceback.format_exc()}")
-                  # Fallback: try without cookies
+                  log("[youtube] imports successful")
+
+                  # Extract video ID for manifest
+                  video_id = None
+                  parsed = urllib.parse.urlparse(URL)
+                  if parsed.hostname in ("youtu.be",):
+                      video_id = parsed.path.lstrip("/")
+                  elif parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
+                      qs = urllib.parse.parse_qs(parsed.query)
+                      video_id = qs.get("v", [None])[0]
+                  log(f"[youtube] video_id: {video_id}")
+
+                  # yt-dlp options: best quality, merge formats, embed metadata, USE CHROME COOKIES
+                  ydl_opts = {
+                      "format": "bestvideo+bestaudio/best",
+                      "merge_output_format": "mp4",
+                      "outtmpl": str(OUT / "%(title)s.%(ext)s"),
+                      "quiet": False,
+                      "no_warnings": False,
+                      "ignoreerrors": False,
+                      "retries": 3,
+                      "fragment_retries": 3,
+                      "extractor_retries": 3,
+                      "user_agent": UA,
+                      "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+                      "cookies_from_browser": ("chrome",),  # Use Chrome cookies!
+                      "postprocessors": [
+                          {"key": "FFmpegMetadata"},
+                          {"key": "EmbedThumbnail"},
+                      ],
+                  }
+
+                  # Try direct download with Chrome cookies
                   try:
-                      log("[youtube] trying without cookies...")
-                      ydl_opts_no_cookies = ydl_opts.copy()
-                      ydl_opts_no_cookies.pop("cookies_from_browser", None)
-                      with yt_dlp.YoutubeDL(ydl_opts_no_cookies) as ydl:
+                      log("[youtube] trying direct download with Chrome cookies...")
+                      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                          # First extract info to get title
+                          info = ydl.extract_info(URL, download=False)
+                          title = info.get("title", "video")
+                          duration = info.get("duration", 0)
+                          log(f"[youtube] title: {title}, duration: {duration}s")
+
+                          # Now download
                           ydl.download([URL])
-                      log("[youtube] download without cookies completed")
-                  except Exception as exc2:
-                      log(f"[youtube] without cookies also failed: {exc2}")
+                      log("[youtube] direct download completed")
+                  except Exception as exc:
+                      log(f"[youtube] direct download failed: {exc}")
                       log(f"[youtube] traceback: {traceback.format_exc()}")
-                      bail("yt-dlp failed: {}".format(exc2),
-                           error=str(exc2), error_with_cookies=str(exc))
+                      # Fallback: try without cookies
+                      try:
+                          log("[youtube] trying without cookies...")
+                          ydl_opts_no_cookies = ydl_opts.copy()
+                          ydl_opts_no_cookies.pop("cookies_from_browser", None)
+                          with yt_dlp.YoutubeDL(ydl_opts_no_cookies) as ydl:
+                              ydl.download([URL])
+                          log("[youtube] download without cookies completed")
+                      except Exception as exc2:
+                          log(f"[youtube] without cookies also failed: {exc2}")
+                          log(f"[youtube] traceback: {traceback.format_exc()}")
+                          bail("yt-dlp failed: {}".format(exc2),
+                               error=str(exc2), error_with_cookies=str(exc))
 
-              # Find downloaded file
-              files = sorted(p for p in OUT.iterdir() if p.is_file() and p.name != "_manifest.json")
-              if not files:
-                  bail("yt-dlp downloaded nothing")
+                  # Find downloaded file
+                  files = sorted(p for p in OUT.iterdir() if p.is_file() and p.name != "_manifest.json")
+                  if not files:
+                      bail("yt-dlp downloaded nothing")
 
-              video_file = files[0]
-              original_name = video_file.name
-              file_size = video_file.stat().st_size
-              log("[youtube] downloaded:", original_name, gib(file_size))
+                  video_file = files[0]
+                  original_name = video_file.name
+                  file_size = video_file.stat().st_size
+                  log("[youtube] downloaded:", original_name, gib(file_size))
 
-              # Change extension to .KNL
-              knl_name = Path(original_name).stem + ".KNL"
-              knl_path = OUT / knl_name
-              video_file.rename(knl_path)
-              log("[youtube] renamed to:", knl_name)
+                  # Change extension to .KNL
+                  knl_name = Path(original_name).stem + ".KNL"
+                  knl_path = OUT / knl_name
+                  video_file.rename(knl_path)
+                  log("[youtube] renamed to:", knl_name)
 
-              # Create ZIP with the .KNL file + manifest
-              import zipfile
-              zip_name = Path(original_name).stem + ".zip"
-              zip_path = OUT / zip_name
-              with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-                  zf.write(knl_path, knl_name)
-                  # Add manifest/log file
-                  manifest_content = (
-                      f"GH Jobs YouTube Download\n"
-                      f"========================\n"
-                      f"Job ID: {JOB_ID}\n"
-                      f"Original URL: {URL}\n"
-                      f"Video ID: {video_id or 'unknown'}\n"
-                      f"Original filename: {original_name}\n"
-                      f"Renamed to: {knl_name}\n"
-                      f"File size: {file_size} bytes ({gib(file_size)})\n"
-                      f"Downloaded at: {datetime.now(timezone.utc).isoformat()}\n"
-                      f"Mode: youtube\n"
-                  )
-                  zf.writestr("download_info.txt", manifest_content)
-              log("[youtube] created ZIP:", zip_name)
+                  # Create ZIP with the .KNL file + manifest
+                  zip_name = Path(original_name).stem + ".zip"
+                  zip_path = OUT / zip_name
+                  with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                      zf.write(knl_path, knl_name)
+                      # Add manifest/log file
+                      manifest_content = (
+                          f"GH Jobs YouTube Download\n"
+                          f"========================\n"
+                          f"Job ID: {JOB_ID}\n"
+                          f"Original URL: {URL}\n"
+                          f"Video ID: {video_id or 'unknown'}\n"
+                          f"Original filename: {original_name}\n"
+                          f"Renamed to: {knl_name}\n"
+                          f"File size: {file_size} bytes ({gib(file_size)})\n"
+                          f"Downloaded at: {datetime.now(timezone.utc).isoformat()}\n"
+                          f"Mode: youtube\n"
+                      )
+                      zf.writestr("download_info.txt", manifest_content)
+                  log("[youtube] created ZIP:", zip_name)
 
-              # Remove the .KNL file (keep only ZIP)
-              knl_path.unlink()
+                  # Remove the .KNL file (keep only ZIP)
+                  knl_path.unlink()
 
-              # Rename ZIP to .MMM
-              mmm_name = Path(original_name).stem + ".MMM"
-              mmm_path = OUT / mmm_name
-              zip_path.rename(mmm_path)
-              log("[youtube] renamed ZIP to MMM:", mmm_name)
+                  # Rename ZIP to .MMM
+                  mmm_name = Path(original_name).stem + ".MMM"
+                  mmm_path = OUT / mmm_name
+                  zip_path.rename(mmm_path)
+                  log("[youtube] renamed ZIP to MMM:", mmm_name)
 
-              manifest({
-                  "job_id": JOB_ID,
-                  "url": URL,
-                  "mode": MODE,
-                  "video_id": video_id,
-                  "original_filename": original_name,
-                  "knl_filename": knl_name,
-                  "mmm_filename": mmm_name,
-                  "bytes": file_size,
-                  "fetched_at": datetime.now(timezone.utc).isoformat(),
-                  "publish_release": PUBLISH_RELEASE,
-              })
-              log("done")
-              sys.exit(0)
+                  manifest({
+                      "job_id": JOB_ID,
+                      "url": URL,
+                      "mode": MODE,
+                      "video_id": video_id,
+                      "original_filename": original_name,
+                      "knl_filename": knl_name,
+                      "mmm_filename": mmm_name,
+                      "bytes": file_size,
+                      "fetched_at": datetime.now(timezone.utc).isoformat(),
+                      "publish_release": PUBLISH_RELEASE,
+                  })
+                  log("done")
+                  sys.exit(0)
+
+              except Exception as exc:
+                  log(f"[youtube] FATAL ERROR: {exc}")
+                  log(f"[youtube] traceback: {traceback.format_exc()}")
+                  bail("YouTube mode crashed: {}".format(exc),
+                       error=str(exc), traceback=traceback.format_exc())
 
           specs = runner_specs()
           robots_ok = robots_verdict(URL)
