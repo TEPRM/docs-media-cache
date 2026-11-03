@@ -102,6 +102,9 @@ jobs:
         with:
           chrome-version: stable
 
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Restore pip cache
         # Cache holds only public PyPI wheels (~/.cache/pip). No URLs,
         # results or logs ever touch this directory. The key is deliberately
@@ -335,33 +338,132 @@ jobs:
                           base_ydl_opts["cookiefile"] = cookie_file.name
                           log("[youtube] using cookies from YOUTUBE_COOKIES secret")
 
-                      download_success = False
-                      last_error = None
-
-                      # PHASE 1: Try Invidious instances by converting URL
-                      log("[youtube] Phase 1: Trying Invidious instances...")
-                      for instance in INVIDIOUS_INSTANCES:
+                      # PHASE 1: Try Invidious API and Piped API for direct stream URLs (most reliable)
+                      log("[youtube] Phase 1: Trying Invidious/Piped APIs for direct streams...")
+                      
+                      # Invidious API instances
+                      INVIDIOUS_API_INSTANCES = [
+                          "https://yewtu.be",
+                          "https://inv.nadeko.net", 
+                          "https://inv.riverside.rocks",
+                          "https://invidious.snopyta.org",
+                          "https://inv.tux.pizza",
+                          "https://yewtu.be",
+                      ]
+                      
+                      # Piped API instances
+                      PIPED_API_INSTANCES = [
+                          "https://piped.kavin.rocks",
+                          "https://piped-api.garudalinux.org",
+                          "https://piped.mha.fi",
+                      ]
+                      
+                      # Try Invidious API first
+                      for instance in INVIDIOUS_API_INSTANCES:
                           if download_success:
                               break
                           try:
-                              invidious_url = f"{instance}/watch?v={video_id}"
-                              log(f"[youtube] trying Invidious: {invidious_url}")
-                              ydl_opts = base_ydl_opts.copy()
-                              # Force generic extractor to avoid YouTube extractor detection
-                              ydl_opts["force_generic_extractor"] = True
-                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                  info = ydl.extract_info(invidious_url, download=False)
-                                  title = info.get("title", "video")
-                                  duration = info.get("duration", 0)
-                                  log(f"[youtube] title: {title}, duration: {duration}s")
-                                  ydl.download([invidious_url])
-                              log(f"[youtube] download completed via {instance}")
-                              download_success = True
-                              break
+                              api_url = f"{instance}/api/v1/videos/{video_id}"
+                              log(f"[youtube] trying Invidious API: {api_url}")
+                              response = requests.get(api_url, headers={"User-Agent": UA}, timeout=30)
+                              if response.status_code == 200:
+                                  data = response.json()
+                                  # Get adaptive formats (separate video/audio)
+                                  formats = data.get("adaptiveFormats", [])
+                                  if formats:
+                                      # Find best video and audio
+                                      video_formats = [f for f in formats if f.get("type", "").startswith("video")]
+                                      audio_formats = [f for f in formats if f.get("type", "").startswith("audio")]
+                                      if video_formats and audio_formats:
+                                          best_video = max(video_formats, key=lambda f: f.get("bitrate", 0))
+                                          best_audio = max(audio_formats, key=lambda f: f.get("bitrate", 0))
+                                          video_url = best_video.get("url")
+                                          audio_url = best_audio.get("url")
+                                          if video_url and audio_url:
+                                              log(f"[youtube] Got streams from {instance}: video={best_video.get('qualityLabel')}, audio={best_audio.get('bitrate')}")
+                                              # Download video
+                                              ydl_opts = base_ydl_opts.copy()
+                                              ydl_opts["force_generic_extractor"] = True
+                                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                                  ydl.download([video_url])
+                                              # Download audio
+                                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                                  ydl.download([audio_url])
+                                              # ffmpeg will merge them in postprocessing
+                                              log(f"[youtube] download completed via Invidious API: {instance}")
+                                              download_success = True
+                                              break
+                              else:
+                                  log(f"[youtube] Invidious API {instance} returned {response.status_code}")
                           except Exception as exc:
                               last_error = exc
-                              log(f"[youtube] Invidious {instance} failed: {exc}")
+                              log(f"[youtube] Invidious API {instance} failed: {exc}")
                               continue
+                      
+                      # Try Piped API
+                      if not download_success:
+                          for instance in PIPED_API_INSTANCES:
+                              if download_success:
+                                  break
+                              try:
+                                  api_url = f"{instance}/streams/{video_id}"
+                                  log(f"[youtube] trying Piped API: {api_url}")
+                                  response = requests.get(api_url, headers={"User-Agent": UA}, timeout=30)
+                                  if response.status_code == 200:
+                                      data = response.json()
+                                      streams = data.get("streams", [])
+                                      if streams:
+                                          # Piped returns combined streams usually
+                                          best_stream = max(streams, key=lambda s: s.get("quality", ""))
+                                          stream_url = best_stream.get("url")
+                                          if stream_url:
+                                              log(f"[youtube] Got stream from Piped {instance}: {best_stream.get('quality')}")
+                                              ydl_opts = base_ydl_opts.copy()
+                                              ydl_opts["force_generic_extractor"] = True
+                                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                                  ydl.download([stream_url])
+                                              log(f"[youtube] download completed via Piped API: {instance}")
+                                              download_success = True
+                                              break
+                                  else:
+                                      log(f"[youtube] Piped API {instance} returned {response.status_code}")
+                              except Exception as exc:
+                                  last_error = exc
+                                  log(f"[youtube] Piped API {instance} failed: {exc}")
+                                  continue
+
+                      # PHASE 1b: Fallback to Invidious watch page (generic extractor)
+                      if not download_success:
+                          log("[youtube] Phase 1b: Trying Invidious watch pages...")
+                          INVIDIOUS_WATCH_INSTANCES = [
+                              "https://yewtu.be",
+                              "https://inv.nadeko.net", 
+                              "https://inv.riverside.rocks",
+                              "https://invidious.snopyta.org",
+                              "https://inv.tux.pizza",
+                              "https://yewtu.be",
+                          ]
+                          for instance in INVIDIOUS_WATCH_INSTANCES:
+                              if download_success:
+                                  break
+                              try:
+                                  invidious_url = f"{instance}/watch?v={video_id}"
+                                  log(f"[youtube] trying Invidious watch: {invidious_url}")
+                                  ydl_opts = base_ydl_opts.copy()
+                                  ydl_opts["force_generic_extractor"] = True
+                                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                      info = ydl.extract_info(invidious_url, download=False)
+                                      title = info.get("title", "video")
+                                      duration = info.get("duration", 0)
+                                      log(f"[youtube] title: {title}, duration: {duration}s")
+                                      ydl.download([invidious_url])
+                                  log(f"[youtube] download completed via {instance}")
+                                  download_success = True
+                                  break
+                              except Exception as exc:
+                                  last_error = exc
+                                  log(f"[youtube] Invidious {instance} failed: {exc}")
+                                  continue
 
                       # PHASE 2: Try different player clients (android/tv often work without cookies)
                       if not download_success:
