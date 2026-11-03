@@ -96,6 +96,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@latest
+        with:
+          chrome-version: stable
+
       - name: Restore pip cache
         uses: actions/cache@v4
         with:
@@ -279,26 +284,14 @@ jobs:
               sys.exit(0)
 
           # ---------------------------------------------------------------
-          # YouTube. yt-dlp handles the extraction and download, with support
-          # for multiple mirror instances (invidioud, yewtu.be, etc.) for
-          # resilience against rate limiting and regional blocks.
+          # YouTube. yt-dlp handles the extraction and download.
+          # Uses Chrome cookies for authentication (bypasses bot detection).
           # ---------------------------------------------------------------
           if MODE == "youtube":
               import yt_dlp
+              import traceback
 
               log("[youtube] starting download with yt-dlp")
-
-              # Multiple Invidious / Piped instances for fallback
-              # These are public instances that proxy YouTube requests
-              YT_MIRRORS = [
-                  "https://yewtu.be",
-                  "https://inv.nadeko.net",
-                  "https://inv.riverside.rocks",
-                  "https://yewtu.be",
-                  "https://invidious.snopyta.org",
-                  "https://inv.tux.pizza",
-                  "https://yewtu.be",
-              ]
 
               # Extract video ID for manifest
               video_id = None
@@ -310,7 +303,7 @@ jobs:
                   qs = urllib.parse.parse_qs(parsed.query)
                   video_id = qs.get("v", [None])[0]
 
-              # yt-dlp options: best quality, merge formats, embed metadata
+              # yt-dlp options: best quality, merge formats, embed metadata, USE CHROME COOKIES
               ydl_opts = {
                   "format": "bestvideo+bestaudio/best",
                   "merge_output_format": "mp4",
@@ -323,50 +316,42 @@ jobs:
                   "extractor_retries": 3,
                   "user_agent": UA,
                   "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+                  "cookies_from_browser": ("chrome",),  # Use Chrome cookies!
                   "postprocessors": [
                       {"key": "FFmpegMetadata"},
                       {"key": "EmbedThumbnail"},
                   ],
               }
 
-              last_error = None
-              for mirror in YT_MIRRORS:
-                  try:
-                      log(f"[youtube] trying mirror: {mirror}")
-                      ydl_opts["extractor_args"] = {
-                          "youtube": {
-                              "player_client": ["android", "web"],
-                              "player_skip": ["configs", "webpage"],
-                          }
-                      }
-                      # Use invidious instance as proxy
-                      ydl_opts["http_headers"]["X-Forwarded-For"] = ""
-                      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                          # First extract info to get title
-                          info = ydl.extract_info(URL, download=False)
-                          title = info.get("title", "video")
-                          duration = info.get("duration", 0)
-                          log(f"[youtube] title: {title}, duration: {duration}s")
+              # Try direct download with Chrome cookies
+              try:
+                  log("[youtube] trying direct download with Chrome cookies...")
+                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                      # First extract info to get title
+                      info = ydl.extract_info(URL, download=False)
+                      title = info.get("title", "video")
+                      duration = info.get("duration", 0)
+                      log(f"[youtube] title: {title}, duration: {duration}s")
 
-                          # Now download
-                          ydl.download([URL])
-                      log("[youtube] download completed")
-                      break
-                  except Exception as exc:
-                      last_error = exc
-                      log(f"[youtube] mirror {mirror} failed: {exc}")
-                      continue
-              else:
-                  # All mirrors failed, try direct without mirror
+                      # Now download
+                      ydl.download([URL])
+                  log("[youtube] direct download completed")
+              except Exception as exc:
+                  log(f"[youtube] direct download failed: {exc}")
+                  log(f"[youtube] traceback: {traceback.format_exc()}")
+                  # Fallback: try without cookies
                   try:
-                      log("[youtube] all mirrors failed, trying direct...")
-                      ydl_opts.pop("extractor_args", None)
-                      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                      log("[youtube] trying without cookies...")
+                      ydl_opts_no_cookies = ydl_opts.copy()
+                      ydl_opts_no_cookies.pop("cookies_from_browser", None)
+                      with yt_dlp.YoutubeDL(ydl_opts_no_cookies) as ydl:
                           ydl.download([URL])
-                      log("[youtube] direct download completed")
-                  except Exception as exc:
-                      bail("yt-dlp failed on all mirrors and direct: {}".format(exc),
-                           error=str(exc), mirrors_tried=YT_MIRRORS)
+                      log("[youtube] download without cookies completed")
+                  except Exception as exc2:
+                      log(f"[youtube] without cookies also failed: {exc2}")
+                      log(f"[youtube] traceback: {traceback.format_exc()}")
+                      bail("yt-dlp failed: {}".format(exc2),
+                           error=str(exc2), error_with_cookies=str(exc))
 
               # Find downloaded file
               files = sorted(p for p in OUT.iterdir() if p.is_file() and p.name != "_manifest.json")
