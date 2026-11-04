@@ -1,0 +1,959 @@
+name: gh-jobs
+
+# run-name is what the UI matches on to find this run again.
+run-name: gh-job-${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job id (used to match the run and the artifact)"
+        required: true
+        type: string
+      target_url:
+        description: "URL to fetch"
+        required: true
+        type: string
+      job_mode:
+        description: "page = structure+text, file = single download, mirror = page plus its assets, gdrive = Google Drive folder or file via gdown, youtube = YouTube video download via yt-dlp"
+        required: true
+        default: page
+        type: choice
+        options:
+          - page
+          - file
+          - mirror
+          - gdrive
+          - youtube
+      max_file_mb:
+        description: "Ceiling for a single download, in MB. The runner's free disk and the account's artifact quota bite first; this just fails fast."
+        required: false
+        default: "2000"
+        type: string
+      byte_start:
+        description: "Start byte (inclusive) for a ranged part download. Empty = whole file."
+        required: false
+        default: ""
+        type: string
+      byte_end:
+        description: "End byte (inclusive) for a ranged part download. Empty = till end."
+        required: false
+        default: ""
+        type: string
+      part_index:
+        description: "Part number within a chunked job. Empty = single file."
+        required: false
+        default: ""
+        type: string
+      part_name:
+        description: "Filename to save the part as inside output/. Empty = auto."
+        required: false
+        default: ""
+        type: string
+      publish_release:
+        description: "Publish as GitHub Release instead of artifact (true/false)"
+        required: false
+        default: "true"
+        type: string
+      release_name:
+        description: "Release name/tag (optional, auto-generated from job_id if empty)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: gh-jobs-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET_URL: ${{ inputs.target_url }}
+      JOB_MODE: ${{ inputs.job_mode }}
+      JOB_ID: ${{ inputs.job_id }}
+      USER_AGENT: gh-jobs/1.0 (+https://github.com/TEPRM/gh-jobs)
+      MAX_ASSET_BYTES: "20000000"
+      # 0 = do not re-compress. A .zim, .7z or .mp4 is already packed, and
+      # deflate on 8 GB of that costs minutes to save nothing.
+      MAX_FILE_MB: ${{ inputs.max_file_mb }}
+      COMPRESSION_LEVEL: "0"
+      BYTE_START: ${{ inputs.byte_start }}
+      BYTE_END: ${{ inputs.byte_end }}
+      PART_INDEX: ${{ inputs.part_index }}
+      PART_NAME: ${{ inputs.part_name }}
+      PUBLISH_RELEASE: ${{ inputs.publish_release }}
+      RELEASE_NAME: ${{ inputs.release_name }}
+      YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@latest
+        with:
+          chrome-version: stable
+
+      - name: Restore pip cache
+        # Cache holds only public PyPI wheels (~/.cache/pip). No URLs,
+        # results or logs ever touch this directory. The key is deliberately
+        # meaningless so the cache list reveals nothing about this repo.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: a1-linux-v1
+          restore-keys: |
+            a1-linux-
+
+      - name: Install dependencies
+        run: python -m pip install --quiet --upgrade pip requests beautifulsoup4 lxml gdown yt-dlp
+
+      # The fetcher lives inline so the repository holds exactly one file.
+      # That keeps the cleanup story simple: delete this workflow and the
+      # repository is empty again.
+      - name: Fetch
+        run: |
+          cat > fetch_job.py <<'PYEOF'
+          import json
+          import os
+          import re
+          import sys
+          import traceback
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          from urllib.robotparser import RobotFileParser
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          URL = os.environ["TARGET_URL"]
+          MODE = os.environ.get("JOB_MODE", "page")
+          JOB_ID = os.environ.get("JOB_ID", "unknown")
+          UA = os.environ.get("USER_AGENT", "gh-jobs/1.0")
+          MAX_ASSET_BYTES = int(os.environ.get("MAX_ASSET_BYTES", "20000000"))
+          MAX_FILE_BYTES = int(float(os.environ.get("MAX_FILE_MB", "2000")) * 1000000)
+          MAX_PAGE_BYTES = int(os.environ.get("MAX_PAGE_BYTES", "52428800"))
+          GDRIVE_CLIENT_ID = os.environ.get("GDRIVE_CLIENT_ID", "")
+          GDRIVE_CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET", "")
+          YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "").strip()
+          BYTE_START = os.environ.get("BYTE_START", "").strip()
+          BYTE_END = os.environ.get("BYTE_END", "").strip()
+          PART_INDEX = os.environ.get("PART_INDEX", "").strip()
+          PART_NAME = os.environ.get("PART_NAME", "").strip()
+          PUBLISH_RELEASE = os.environ.get("PUBLISH_RELEASE", "true").lower() == "true"
+          RELEASE_NAME = os.environ.get("RELEASE_NAME", "").strip()
+
+          OUT = Path("output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          CHUNK = 1024 * 1024
+
+          def gib(n):
+              return "{:.2f} GiB".format(n / 1073741824)
+
+          def runner_specs():
+              info = {}
+              try:
+                  import subprocess
+                  mem = subprocess.check_output(["free", "-b"], text=True)
+                  for line in mem.splitlines():
+                      if line.startswith("Mem:"):
+                          info["ram_total"] = int(line.split()[1])
+                          info["ram_available"] = int(line.split()[6])
+              except Exception:
+                  pass
+              try:
+                  st = os.statvfs(".")
+                  info["disk_free"] = st.f_bavail * st.f_frsize
+              except Exception:
+                  pass
+              log("[runner] ram total:", gib(info.get("ram_total", 0)),
+                  "| ram free:", gib(info.get("ram_available", 0)),
+                  "| disk free:", gib(info.get("disk_free", 0)))
+              return info
+
+          def log(*parts):
+              print(*parts, flush=True)
+
+          def manifest(payload):
+              (OUT / "_manifest.json").write_text(
+                  json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          def bail(error, **extra):
+              log("ERROR:", error)
+              # Remove 'error' from extra if present to avoid duplicate
+              extra.pop("error", None)
+              manifest(dict({"job_id": JOB_ID, "url": URL, "mode": MODE,
+                             "error": error}, **extra))
+              sys.exit(1)
+
+          def robots_verdict(url):
+              parsed = urlparse(url)
+              parser = RobotFileParser()
+              parser.set_url("{}://{}/robots.txt".format(parsed.scheme, parsed.netloc))
+              try:
+                  parser.read()
+              except Exception as exc:
+                  log("[robots] unreadable ({}), continuing".format(exc))
+                  return None
+              allowed = parser.can_fetch(UA, url)
+              log("[robots] {} disallows this path: {}".format(
+                  parser.url, "yes" if not allowed else "no"))
+              return allowed
+
+          def safe_name(name):
+              name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+              return name or "file"
+
+          log("job:", JOB_ID, "mode:", MODE)
+          log("url:", URL)
+          log("publish_release:", PUBLISH_RELEASE)
+
+          # Top-level try/except to ensure manifest is always written
+          try:
+              # ---------------------------------------------------------------
+              # Google Drive
+              # ---------------------------------------------------------------
+              if MODE == "gdrive":
+                  import gdown
+
+                  drive_dir = OUT / "drive"
+                  drive_dir.mkdir(exist_ok=True)
+
+                  opts = {"quiet": False, "use_cookies": False,
+                          "user_agent": UA, "retries": 3, "timeout": 120}
+
+                  authed = bool(GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET)
+                  if authed:
+                      os.environ["GDRIVE_CLIENT_ID"] = GDRIVE_CLIENT_ID
+                      os.environ["GDRIVE_CLIENT_SECRET"] = GDRIVE_CLIENT_SECRET
+                      log("[gdrive] using OAuth credentials")
+                  else:
+                      log("[gdrive] no OAuth credentials, links must be public")
+
+                  try:
+                      gdown.download_folder(url=URL, output=str(drive_dir), **opts)
+                  except Exception as exc:
+                      log("[gdrive] not a folder ({}), trying a single file".format(
+                          type(exc).__name__))
+                      try:
+                          gdown.download(url=URL, output=str(drive_dir), **opts)
+                      except Exception as inner:
+                          log("[gdrive] download failed:", repr(inner))
+                          bail("gdown could not download this link: {}".format(inner),
+                               authenticated=authed)
+
+                  files = sorted(p for p in drive_dir.rglob("*") if p.is_file())
+                  if not files:
+                      bail("gdown downloaded nothing. If the file is not shared with "
+                           "'anyone with the link', set GDRIVE_CLIENT_ID and "
+                           "GDRIVE_CLIENT_SECRET.")
+
+                  total = sum(p.stat().st_size for p in files)
+                  log("[gdrive] downloaded", len(files), "files,", total, "bytes")
+                  manifest({
+                      "job_id": JOB_ID, "url": URL, "mode": MODE,
+                      "authenticated": bool(GDRIVE_CLIENT_ID),
+                      "file_count": len(files),
+                      "bytes": total,
+                      "files": [str(p.relative_to(drive_dir)).replace("\\", "/")
+                                for p in files],
+                      "fetched_at": datetime.now(timezone.utc).isoformat(),
+                      "publish_release": PUBLISH_RELEASE,
+                  })
+                  log("done")
+                  sys.exit(0)
+
+              # ---------------------------------------------------------------
+              # YouTube. yt-dlp handles the extraction and download.
+              # Multiple strategies to bypass bot detection WITHOUT cookies.
+              # ---------------------------------------------------------------
+              if MODE == "youtube":
+                  log("[youtube] starting YouTube mode")
+                  try:
+                      import yt_dlp
+                      import urllib.parse
+                      import zipfile
+
+                      log("[youtube] imports successful")
+
+                      # Extract video ID for manifest
+                      video_id = None
+                      parsed = urllib.parse.urlparse(URL)
+                      if parsed.hostname in ("youtu.be",):
+                          video_id = parsed.path.lstrip("/")
+                      elif parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
+                          qs = urllib.parse.parse_qs(parsed.query)
+                          video_id = qs.get("v", [None])[0]
+                      log(f"[youtube] video_id: {video_id}")
+
+                      # ================================================================
+                      # EXPANDED PUBLIC INSTANCES (Invidious + Piped)
+                      # These are public YouTube frontends that don't require cookies
+                      # ================================================================
+                      INVIDIOUS_INSTANCES = [
+                          "https://yewtu.be",
+                          "https://inv.nadeko.net",
+                          "https://inv.riverside.rocks",
+                          "https://invidious.snopyta.org",
+                          "https://inv.tux.pizza",
+                          "https://invidious.nerdvpn.de",
+                          "https://inv.vern.cc",
+                          "https://yewtu.be/api",
+                          "https://invidious.projectsegfau.lt",
+                          "https://invidious.privacydev.net",
+                      ]
+
+                      PIPED_INSTANCES = [
+                          "https://piped-api.kavin.rocks",
+                          "https://piped-api.lunar.icu",
+                          "https://piped.adminforge.de",
+                          "https://piped.mha.fi",
+                          "https://piped.projectsegfau.lt",
+                      ]
+
+                      # yt-dlp base options - optimized for server/no-cookies environment
+                      base_ydl_opts = {
+                          "format": "bestvideo+bestaudio/best",
+                          "merge_output_format": "mp4",
+                          "outtmpl": str(OUT / "%(title)s.%(ext)s"),
+                          "quiet": False,
+                          "no_warnings": False,
+                          "ignoreerrors": False,
+                          "retries": 5,
+                          "fragment_retries": 5,
+                          "extractor_retries": 5,
+                          "file_access_retries": 5,
+                          "user_agent": UA,
+                          "http_headers": {
+                              "Accept-Language": "en-US,en;q=0.9",
+                              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                          },
+                          "postprocessors": [
+                              {"key": "FFmpegMetadata"},
+                              {"key": "EmbedThumbnail"},
+                          ],
+                          # Critical for server environments:
+                          "noprogress": True,
+                          "consoletitle": False,
+                          # IPv4 often works better on cloud runners:
+                          "force_ipv4": True,
+                          # Skip HLS/DASH manifests that often trigger bot checks:
+                          "extractor_args": {
+                              "youtube": {
+                                  "player_skip": ["configs", "webpage", "hls", "dash"],
+                              }
+                          },
+                      }
+
+                      # Add cookies if provided via YOUTUBE_COOKIES secret
+                      if YOUTUBE_COOKIES:
+                          import tempfile
+                          cookie_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+                          cookie_file.write(YOUTUBE_COOKIES)
+                          cookie_file.close()
+                          base_ydl_opts["cookiefile"] = cookie_file.name
+                          log("[youtube] using cookies from YOUTUBE_COOKIES secret")
+
+                      download_success = False
+                      last_error = None
+                      downloaded_file = None
+                      video_title = "video"
+
+                      # ================================================================
+                      # PHASE 1: Try Invidious instances (public proxies)
+                      # ================================================================
+                      log("[youtube] Phase 1: Trying Invidious instances...")
+                      for instance in INVIDIOUS_INSTANCES:
+                          if download_success:
+                              break
+                          try:
+                              invidious_url = f"{instance}/watch?v={video_id}"
+                              log(f"[youtube] trying Invidious: {invidious_url}")
+                              ydl_opts = base_ydl_opts.copy()
+                              ydl_opts["force_generic_extractor"] = True
+                              ydl_opts["extractor_args"] = {
+                                  "generic": {"force_no_playlist": True}
+                              }
+                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                  info = ydl.extract_info(invidious_url, download=False)
+                                  video_title = info.get("title", "video")
+                                  duration = info.get("duration", 0)
+                                  log(f"[youtube] title: {video_title}, duration: {duration}s")
+                                  ydl.download([invidious_url])
+                              log(f"[youtube] download completed via {instance}")
+                              download_success = True
+                              break
+                          except Exception as exc:
+                              last_error = exc
+                              log(f"[youtube] Invidious {instance} failed: {exc}")
+                              continue
+
+                      # ================================================================
+                      # PHASE 2: Try Piped instances (another YouTube frontend)
+                      # ================================================================
+                      if not download_success:
+                          log("[youtube] Phase 2: Trying Piped instances...")
+                          for instance in PIPED_INSTANCES:
+                              if download_success:
+                                  break
+                              try:
+                                  piped_url = f"{instance}/watch?v={video_id}"
+                                  log(f"[youtube] trying Piped: {piped_url}")
+                                  ydl_opts = base_ydl_opts.copy()
+                                  ydl_opts["force_generic_extractor"] = True
+                                  ydl_opts["extractor_args"] = {
+                                      "generic": {"force_no_playlist": True}
+                                  }
+                                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                      info = ydl.extract_info(piped_url, download=False)
+                                      video_title = info.get("title", "video")
+                                      duration = info.get("duration", 0)
+                                      log(f"[youtube] title: {video_title}, duration: {duration}s")
+                                      ydl.download([piped_url])
+                                  log(f"[youtube] download completed via {instance}")
+                                  download_success = True
+                                  break
+                              except Exception as exc:
+                                  last_error = exc
+                                  log(f"[youtube] Piped {instance} failed: {exc}")
+                                  continue
+
+                      # ================================================================
+                      # PHASE 3: Try different player clients (android/tv/mweb)
+                      # These often work WITHOUT cookies because they mimic official apps
+                      # ================================================================
+                      if not download_success:
+                          log("[youtube] Phase 3: Trying player clients (no cookies)...")
+                          # Order matters: android/tv/mweb are most likely to work without auth
+                          player_client_combos = [
+                              (["android"], "Android client"),
+                              (["tv"], "TV client"),
+                              (["mweb"], "Mobile web client"),
+                              (["android", "tv"], "Android + TV"),
+                              (["android", "mweb"], "Android + Mobile web"),
+                              (["tv", "mweb"], "TV + Mobile web"),
+                              (["android", "tv", "mweb"], "Android + TV + Mobile web"),
+                              (["web"], "Web client (may need cookies)"),
+                              (["web", "android"], "Web + Android"),
+                          ]
+
+                          for clients, desc in player_client_combos:
+                              if download_success:
+                                  break
+                              try:
+                                  log(f"[youtube] trying with {desc}: {clients}...")
+                                  ydl_opts = base_ydl_opts.copy()
+                                  ydl_opts["extractor_args"] = {
+                                      "youtube": {
+                                          "player_client": clients,
+                                          "player_skip": ["configs", "webpage", "hls", "dash"],
+                                          "skip": ["hls", "dash"],
+                                      }
+                                  }
+                                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                      info = ydl.extract_info(URL, download=False)
+                                      video_title = info.get("title", "video")
+                                      duration = info.get("duration", 0)
+                                      log(f"[youtube] title: {video_title}, duration: {duration}s")
+                                      ydl.download([URL])
+                                  log(f"[youtube] download completed with {desc}")
+                                  download_success = True
+                                  break
+                              except Exception as exc:
+                                  last_error = exc
+                                  log(f"[youtube] {desc} failed: {exc}")
+                                  continue
+
+                      # ================================================================
+                      # PHASE 4: Try with format selection (lower quality = less protection)
+                      # ================================================================
+                      if not download_success:
+                          log("[youtube] Phase 4: Trying format restrictions...")
+                          format_strategies = [
+                              ("bestvideo[height<=720]+bestaudio/best[height<=720]", "720p max"),
+                              ("bestvideo[height<=480]+bestaudio/best[height<=480]", "480p max"),
+                              ("bestvideo[height<=360]+bestaudio/best[height<=360]", "360p max"),
+                              ("bestaudio/best", "audio only"),
+                              ("worst", "worst quality"),
+                          ]
+                          
+                          for fmt, desc in format_strategies:
+                              if download_success:
+                                  break
+                              try:
+                                  log(f"[youtube] trying format: {desc} ({fmt})")
+                                  ydl_opts = base_ydl_opts.copy()
+                                  ydl_opts["format"] = fmt
+                                  ydl_opts["extractor_args"] = {
+                                      "youtube": {
+                                          "player_client": ["android", "tv", "mweb"],
+                                          "player_skip": ["configs", "webpage", "hls", "dash"],
+                                          "skip": ["hls", "dash"],
+                                      }
+                                  }
+                                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                      info = ydl.extract_info(URL, download=False)
+                                      video_title = info.get("title", "video")
+                                      duration = info.get("duration", 0)
+                                      log(f"[youtube] title: {video_title}, duration: {duration}s")
+                                      ydl.download([URL])
+                                  log(f"[youtube] download completed with {desc}")
+                                  download_success = True
+                                  break
+                              except Exception as exc:
+                                  last_error = exc
+                                  log(f"[youtube] format {desc} failed: {exc}")
+                                  continue
+
+                      # ================================================================
+                      # PHASE 5: Try yt-dlp's built-in "po_token" workaround
+                      # This uses a proof-of-origin token that can work without cookies
+                      # ================================================================
+                      if not download_success:
+                          log("[youtube] Phase 5: Trying with PO token workaround...")
+                          try:
+                              ydl_opts = base_ydl_opts.copy()
+                              ydl_opts["extractor_args"] = {
+                                  "youtube": {
+                                      "player_client": ["android", "tv"],
+                                      "player_skip": ["configs", "webpage", "hls", "dash"],
+                                      "skip": ["hls", "dash"],
+                                      "po_token": "auto",  # Let yt-dlp try to generate one
+                                  }
+                              }
+                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                  info = ydl.extract_info(URL, download=False)
+                                  video_title = info.get("title", "video")
+                                  duration = info.get("duration", 0)
+                                  log(f"[youtube] title: {video_title}, duration: {duration}s")
+                                  ydl.download([URL])
+                              log("[youtube] download completed with PO token")
+                              download_success = True
+                          except Exception as exc:
+                              last_error = exc
+                              log(f"[youtube] PO token failed: {exc}")
+
+                      # ================================================================
+                      # PHASE 6: Try yt-dlp with --cookies-from-browser ONLY if Chrome exists
+                      # This is last resort since it won't work on headless servers
+                      # ================================================================
+                      if not download_success:
+                          log("[youtube] Phase 6: Trying Chrome cookies (last resort)...")
+                          try:
+                              ydl_opts = base_ydl_opts.copy()
+                              ydl_opts["cookies_from_browser"] = ("chrome",)
+                              ydl_opts["extractor_args"] = {
+                                  "youtube": {
+                                      "player_client": ["android", "web"],
+                                      "player_skip": ["configs", "webpage", "hls", "dash"],
+                                  }
+                              }
+                              with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                  info = ydl.extract_info(URL, download=False)
+                                  video_title = info.get("title", "video")
+                                  duration = info.get("duration", 0)
+                                  log(f"[youtube] title: {video_title}, duration: {duration}s")
+                                  ydl.download([URL])
+                              log("[youtube] download completed with Chrome cookies")
+                              download_success = True
+                          except Exception as exc:
+                              last_error = exc
+                              log(f"[youtube] Chrome cookies also failed: {exc}")
+
+                      # ================================================================
+                      # FINAL CHECK
+                      # ================================================================
+                      if not download_success:
+                          bail("yt-dlp failed with all methods: {}".format(last_error),
+                               last_error=str(last_error),
+                               phases_tried=6,
+                               video_id=video_id)
+
+                      # Find downloaded file
+                      files = sorted(p for p in OUT.iterdir() if p.is_file() and p.name != "_manifest.json")
+                      if not files:
+                          bail("yt-dlp downloaded nothing")
+
+                      video_file = files[0]
+                      original_name = video_file.name
+                      file_size = video_file.stat().st_size
+                      log("[youtube] downloaded:", original_name, gib(file_size))
+
+                      # Change extension to .KNL
+                      knl_name = Path(original_name).stem + ".KNL"
+                      knl_path = OUT / knl_name
+                      video_file.rename(knl_path)
+                      log("[youtube] renamed to:", knl_name)
+
+                      # Create ZIP with the .KNL file + manifest
+                      zip_name = Path(original_name).stem + ".zip"
+                      zip_path = OUT / zip_name
+                      with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                          zf.write(knl_path, knl_name)
+                          manifest_content = (
+                              f"GH Jobs YouTube Download\n"
+                              f"========================\n"
+                              f"Job ID: {JOB_ID}\n"
+                              f"Original URL: {URL}\n"
+                              f"Video ID: {video_id or 'unknown'}\n"
+                              f"Original filename: {original_name}\n"
+                              f"Renamed to: {knl_name}\n"
+                              f"File size: {file_size} bytes ({gib(file_size)})\n"
+                              f"Downloaded at: {datetime.now(timezone.utc).isoformat()}\n"
+                              f"Mode: youtube\n"
+                          )
+                          zf.writestr("download_info.txt", manifest_content)
+                      log("[youtube] created ZIP:", zip_name)
+
+                      # Remove the .KNL file (keep only ZIP)
+                      knl_path.unlink()
+
+                      # Rename ZIP to .MMM
+                      mmm_name = Path(original_name).stem + ".MMM"
+                      mmm_path = OUT / mmm_name
+                      zip_path.rename(mmm_path)
+                      log("[youtube] renamed ZIP to MMM:", mmm_name)
+
+                      manifest({
+                          "job_id": JOB_ID,
+                          "url": URL,
+                          "mode": MODE,
+                          "video_id": video_id,
+                          "original_filename": original_name,
+                          "knl_filename": knl_name,
+                          "mmm_filename": mmm_name,
+                          "bytes": file_size,
+                          "fetched_at": datetime.now(timezone.utc).isoformat(),
+                          "publish_release": PUBLISH_RELEASE,
+                      })
+                      log("done")
+                      sys.exit(0)
+
+                  except Exception as exc:
+                      log(f"[youtube] FATAL ERROR: {exc}")
+                      log(f"[youtube] traceback: {traceback.format_exc()}")
+                      bail("YouTube mode crashed: {}".format(exc),
+                           error=str(exc), traceback=traceback.format_exc())
+
+              # ---------------------------------------------------------------
+              # Regular file / page / mirror modes
+              # ---------------------------------------------------------------
+              specs = runner_specs()
+              robots_ok = robots_verdict(URL)
+
+              req_headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+              is_part = bool(BYTE_START or BYTE_END)
+              if is_part:
+                  if BYTE_START and BYTE_END:
+                      req_headers["Range"] = "bytes={}-{}".format(BYTE_START, BYTE_END)
+                  elif BYTE_START:
+                      req_headers["Range"] = "bytes={}-".format(BYTE_START)
+                  log("ranged request:", req_headers.get("Range"))
+              try:
+                  response = requests.get(
+                      URL,
+                      headers=req_headers,
+                      timeout=(30, 120),
+                      allow_redirects=True,
+                      stream=True,
+                  )
+              except requests.RequestException as exc:
+                  bail("request failed: {}".format(exc))
+
+              log("status:", response.status_code)
+              log("final url:", response.url)
+              log("content-type:", response.headers.get("content-type"))
+              if is_part:
+                  log("content-range:", response.headers.get("content-range"))
+
+              if response.status_code >= 400:
+                  response.close()
+                  bail("server returned HTTP {}".format(response.status_code),
+                       status_code=response.status_code, final_url=response.url)
+
+              if is_part and response.status_code != 206:
+                  response.close()
+                  bail("server does not support ranged downloads (expected HTTP 206, got {})".format(
+                       response.status_code), status_code=response.status_code)
+
+              declared = int(response.headers.get("content-length") or 0)
+              if declared:
+                  log("declared size:", gib(declared))
+
+              if MODE == "file":
+                  if declared > MAX_FILE_BYTES:
+                      response.close()
+                      bail("file is {}, over the {} ceiling".format(
+                           gib(declared), gib(MAX_FILE_BYTES)),
+                           declared_bytes=declared, limit_bytes=MAX_FILE_BYTES)
+
+                  need = (declared or MAX_FILE_BYTES) * 2
+                  free = specs.get("disk_free", 0)
+                  if free and need > free:
+                      response.close()
+                      bail("not enough disk for a {} file: needs about {} "
+                           "(file plus zip) and the runner has {}".format(
+                               gib(declared or MAX_FILE_BYTES), gib(need), gib(free)),
+                           declared_bytes=declared, disk_free_bytes=free,
+                           disk_needed_bytes=need)
+
+                  filename = safe_name(
+                      PART_NAME or Path(urlparse(response.url).path).name or "download.bin")
+                  target = OUT / filename
+                  written = 0
+                  try:
+                      with open(target, "wb") as fh:
+                          for chunk in response.iter_content(CHUNK):
+                              if not chunk:
+                                  continue
+                              written += len(chunk)
+                              fh.write(chunk)
+                              if written % (64 * CHUNK) < CHUNK:
+                                  log("  downloaded", gib(written))
+                  except requests.RequestException as exc:
+                      bail("download interrupted at {}: {}".format(gib(written), exc),
+                           partial_bytes=written)
+
+                  if is_part and BYTE_START and BYTE_END:
+                      expected = int(BYTE_END) - int(BYTE_START) + 1
+                      if written != expected:
+                          response.close()
+                          bail("part size mismatch: got {} bytes, expected {}".format(
+                               written, expected),
+                               written_bytes=written, expected_bytes=expected,
+                               byte_start=BYTE_START, byte_end=BYTE_END)
+
+                  log("saved:", filename, gib(written))
+                  saved.append(filename)
+                  content_bytes = written
+                  response.close()
+              else:
+                  if declared > MAX_PAGE_BYTES:
+                      response.close()
+                      bail("page is {}, over the {} ceiling".format(
+                           gib(declared), gib(MAX_PAGE_BYTES)),
+                           declared_bytes=declared, limit_bytes=MAX_PAGE_BYTES)
+
+                  buffer = bytearray()
+                  try:
+                      for chunk in response.iter_content(CHUNK):
+                          if chunk:
+                              buffer += chunk
+                  except requests.RequestException as exc:
+                      bail("download interrupted: {}".format(exc))
+                  response.close()
+                  content_bytes = len(buffer)
+                  log("bytes:", content_bytes)
+
+                  (OUT / "page.html").write_bytes(bytes(buffer))
+                  saved.append("page.html")
+
+                  soup = BeautifulSoup(bytes(buffer), "lxml")
+                  for tag in soup(["script", "style", "noscript"]):
+                      tag.decompose()
+
+                  (OUT / "text.txt").write_text(
+                      soup.get_text("\n", strip=True), encoding="utf-8")
+                  saved.append("text.txt")
+
+                  links = sorted({urljoin(response.url, a["href"])
+                                  for a in soup.find_all("a", href=True)})
+                  (OUT / "links.json").write_text(
+                      json.dumps(links, ensure_ascii=False, indent=2), encoding="utf-8")
+                  saved.append("links.json")
+
+                  headings = [h.get_text(" ", strip=True)
+                              for h in soup.find_all(["h1", "h2", "h3"])]
+                  (OUT / "headings.json").write_text(
+                      json.dumps(headings, ensure_ascii=False, indent=2), encoding="utf-8")
+                  saved.append("headings.json")
+
+                  if MODE == "mirror":
+                      msoup = BeautifulSoup(bytes(buffer), "lxml")
+
+                      refs = []
+                      for tag, attr in (("img", "src"), ("script", "src"),
+                                        ("source", "src"), ("video", "poster")):
+                          for node in msoup.find_all(tag):
+                              if node.get(attr):
+                                  refs.append((node, attr, urljoin(response.url, node[attr])))
+                      for node in msoup.find_all("link", href=True):
+                          rel = node.get("rel") or []
+                          if isinstance(rel, str):
+                              rel = [rel]
+                          if any(r in ("stylesheet", "icon", "apple-touch-icon")
+                                 for r in rel):
+                              refs.append((node, "href",
+                                           urljoin(response.url, node["href"])))
+
+                      for node in msoup.find_all(srcset=True):
+                          first = node["srcset"].split(",")[0].strip().split(" ")[0]
+                          if first:
+                              refs.append((node, "srcset",
+                                           urljoin(response.url, first)))
+
+                      refs = [r for r in refs if r[2].startswith(("http://", "https://"))]
+                      log("assets referenced:", len(refs))
+
+                      assets_dir = OUT / "assets"
+                      assets_dir.mkdir(exist_ok=True)
+                      budget = MAX_ASSET_BYTES
+                      kept = 0
+                      rewritten = 0
+
+                      for index, (node, attr, src) in enumerate(refs):
+                          if budget <= 0:
+                              log("[mirror] byte budget reached, stopping")
+                              break
+                          try:
+                              asset = requests.get(
+                                  src, headers={"User-Agent": UA}, timeout=30)
+                              if asset.status_code != 200 or not asset.content:
+                                  continue
+                              if len(asset.content) > budget:
+                                  log("[mirror] skipping oversized", src)
+                                  continue
+                              name = safe_name(
+                                  Path(urlparse(src).path).name
+                                  or "asset-{:04d}".format(index))
+                              target = assets_dir / name
+                              counter = 1
+                              while target.exists():
+                                  target = assets_dir / "{}_{}".format(name, counter)
+                                  counter += 1
+                              target.write_bytes(asset.content)
+                              budget -= len(asset.content)
+                              kept += 1
+
+                              local = "assets/" + target.name
+                              if attr == "srcset":
+                                  picked = []
+                                  for candidate in src.split(","):
+                                      parts = candidate.strip().split()
+                                      if not parts:
+                                          continue
+                                      parts[0] = local
+                                      picked.append(" ".join(parts))
+                                  node[attr] = ", ".join(picked)
+                              else:
+                                  node[attr] = local
+                              rewritten += 1
+                          except Exception as exc:
+                              log("[mirror] failed", src, exc)
+
+                      (OUT / "page.html").write_text(
+                          str(msoup), encoding="utf-8")
+                      log("mirror saved", kept, "assets,",
+                          "rewrote", rewritten, "references")
+                      saved.append("assets")
+
+              report = {
+                  "job_id": JOB_ID,
+                  "url": URL,
+                  "final_url": response.url,
+                  "mode": MODE,
+                  "status_code": response.status_code,
+                  "bytes": content_bytes,
+                  "fetched_at": datetime.now(timezone.utc).isoformat(),
+                  "robots_allows_fetch": robots_ok,
+                  "runner": specs,
+                  "byte_start": BYTE_START or None,
+                  "byte_end": BYTE_END or None,
+                  "part_index": PART_INDEX or None,
+                  "part_name": PART_NAME or None,
+                  "publish_release": PUBLISH_RELEASE,
+                  "files": sorted(
+                      (p.name, p.stat().st_size) for p in OUT.iterdir()
+                      if p.is_file()),
+              }
+              (OUT / "_manifest.json").write_text(
+                  json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+              log("output:", report["files"])
+              log("done")
+
+          except Exception as exc:
+              log(f"FATAL ERROR: {exc}")
+              log(f"Traceback: {traceback.format_exc()}")
+              manifest({"job_id": JOB_ID, "url": URL, "mode": MODE,
+                       "error": str(exc), "traceback": traceback.format_exc()})
+              sys.exit(1)
+
+          PYEOF
+          set +e
+          python -u fetch_job.py
+          code=$?
+          set -e
+          echo "fetcher exit code: $code"
+
+          # The fetcher may have died before writing anything. Make sure the
+          # artifact upload always has a manifest to carry, otherwise the UI
+          # gets a failure with no explanation at all.
+          if [ ! -f output/_manifest.json ]; then
+            echo "no manifest was written, recording the failure"
+            printf '{\n  "error": "fetcher exited with code %s before writing a manifest"\n}\n' \
+              "$code" > output/_manifest.json
+          fi
+          cat output/_manifest.json
+
+      - name: Package
+        run: |
+          ls -la output
+          du -sh output
+
+      - name: Determine release tag and name
+        id: release_info
+        run: |
+          JOB_ID="${{ inputs.job_id }}"
+          RELEASE_NAME="${{ inputs.release_name }}"
+          if [ -n "$RELEASE_NAME" ]; then
+            TAG="$RELEASE_NAME"
+            NAME="$RELEASE_NAME"
+          else
+            TAG="gh-job-$JOB_ID"
+            NAME="gh-job-$JOB_ID"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+      - name: Create Release and Upload Asset
+        if: ${{ env.PUBLISH_RELEASE == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          name: ${{ steps.release_info.outputs.name }}
+          draft: false
+          prerelease: false
+          files: output/*
+          generate_release_notes: false
+          body: |
+            **GH Job Download**
+            
+            - **Job ID**: ${{ inputs.job_id }}
+            - **Mode**: ${{ inputs.job_mode }}
+            - **URL**: ${{ inputs.target_url }}
+            - **Created**: ${{ github.event.repository.updated_at }}
+            
+            This release was created automatically by GH Jobs. Click the asset below to download.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Artifact (fallback when release publishing disabled)
+        if: ${{ env.PUBLISH_RELEASE != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ inputs.job_id }}
+          path: output/
+          retention-days: 1
+          compression-level: ${{ env.COMPRESSION_LEVEL }}
+          if-no-files-found: warn
